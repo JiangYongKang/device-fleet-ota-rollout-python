@@ -14,6 +14,7 @@ from .models import (
     Device,
     DeviceView,
     TERMINAL_UPGRADE_STATUSES,
+    UpgradeHistoryEntry,
     UpgradeStatus,
 )
 from .store import Store
@@ -88,6 +89,51 @@ class DeviceService:
     def list_devices(self) -> list[DeviceView]:
         with self.store.lock:
             return [self._view(d) for d in self.store.list_devices()]
+
+    def get_upgrade_history(self, device_id: str) -> list[UpgradeHistoryEntry]:
+        """设备参与过的历次发布：每轮的目标版本、基线版本与最终结果。
+
+        纯读操作，按 (assigned_at, release_id) 排序，重复/并发查询结论一致；
+        设备从未参与任何发布时返回空列表。
+        """
+        with self.store.lock:
+            device = self.store.get_device(device_id)
+            if device is None:
+                raise OtaError(RejectReason.DEVICE_NOT_FOUND, f"device_id={device_id}")
+            records = [
+                r for (rid, d), r in self.store.records.items() if d == device_id
+            ]
+            records.sort(
+                key=lambda r: (
+                    r.assigned_at if r.assigned_at is not None else -1.0,
+                    r.release_id,
+                )
+            )
+            entries: list[UpgradeHistoryEntry] = []
+            for rec in records:
+                release = self.store.get_release(rec.release_id)
+                firmware = (
+                    self.store.get_firmware(release.firmware_id)
+                    if release is not None else None
+                )
+                entries.append(UpgradeHistoryEntry(
+                    release_id=rec.release_id,
+                    target_version=firmware.version if firmware else None,
+                    from_version=rec.from_version,
+                    status=rec.status,
+                    batch_index=rec.batch_index,
+                    failure_reason=rec.failure_reason,
+                    last_stage=rec.last_stage,
+                    assigned_at=rec.assigned_at,
+                    updated_at=rec.updated_at,
+                ))
+            log_decision(
+                "get_upgrade_history",
+                {"device_id": device_id},
+                "ok",
+                rounds=len(entries),
+            )
+            return entries
 
     # ---------- internals ----------
 

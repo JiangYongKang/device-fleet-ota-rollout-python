@@ -65,6 +65,11 @@ def get_device(device_id: str):
     return _device_dict(device_service.get_device(device_id))
 
 
+@app.get("/devices/{device_id}/history")
+def get_device_history(device_id: str):
+    return [_history_dict(e) for e in device_service.get_upgrade_history(device_id)]
+
+
 @app.get("/devices")
 def list_devices():
     return [_device_dict(v) for v in device_service.list_devices()]
@@ -124,8 +129,11 @@ def list_releases():
 
 # ---- report ----
 @app.post("/devices/{device_id}/report")
-def report_upgrade_result(device_id: str, stage: ReportStage, failure_reason: str | None = None):
-    return _device_dict(report_service.report_result(device_id, stage, failure_reason))
+def report_upgrade_result(device_id: str, stage: ReportStage,
+                          failure_reason: str | None = None,
+                          release_id: str | None = None):
+    return _device_dict(report_service.report_result(
+        device_id, stage, failure_reason, release_id=release_id))
 
 
 # ---- serializers ----
@@ -165,4 +173,19 @@ def _release_dict(v):
         "next_batch_to_open": v.next_batch_to_open,
         "batches": v.batches,
         "skipped_device_ids": v.skipped_device_ids,
+        "skipped": v.skipped,
+    }
+
+
+def _history_dict(e):
+    return {
+        "release_id": e.release_id,
+        "target_version": e.target_version,
+        "from_version": e.from_version,
+        "status": e.status.value,
+        "batch_index": e.batch_index,
+        "failure_reason": e.failure_reason,
+        "last_stage": e.last_stage.value if e.last_stage else None,
+        "assigned_at": e.assigned_at,
+        "updated_at": e.updated_at,
     }

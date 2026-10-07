@@ -163,6 +163,8 @@ class Release:
     batches: list[Batch] = field(default_factory=list)
     next_batch_to_open: int = 0        # 下一个待打开的批次序号
     skipped_device_ids: list[str] = field(default_factory=list)
+    # 设备 -> 占用它的进行中发布：解释“为什么这台设备本轮分不进来”
+    skipped_devices: dict[str, str] = field(default_factory=dict)
     created_at: Optional[float] = None
     updated_at: Optional[float] = None
 
@@ -187,3 +189,19 @@ class ReleaseView:
     next_batch_to_open: int
     batches: list[dict]
     skipped_device_ids: list[str]
+    # 每项 {"device_id": ..., "occupied_by": ...}，按 device_id 排序，查询结论稳定
+    skipped: list[dict] = field(default_factory=list)
+
+
+@dataclass
+class UpgradeHistoryEntry:
+    """设备参与过的某一轮发布的最终结果（升级历史条目）。"""
+    release_id: str
+    target_version: Optional[str]
+    from_version: Optional[str]
+    status: UpgradeStatus
+    batch_index: int
+    failure_reason: Optional[str]
+    last_stage: Optional[ReportStage]
+    assigned_at: Optional[float]
+    updated_at: Optional[float]

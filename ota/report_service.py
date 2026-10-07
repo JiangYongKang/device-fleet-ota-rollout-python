@@ -3,12 +3,17 @@
 拒绝原因（彼此可区分，绝不静默接受）：
 - device_not_found / release_not_found：设备或所属发布不存在；
 - device_not_in_target_group：设备不属于任何进行中发布（未被分配到本次升级）；
+- device_in_another_active_release：设备正被另一个进行中发布占用，上报却指向本发布；
 - below_min_version：设备当前固件版本低于固件要求的最低版本；
 - release_paused：发布被手动/自动暂停（暂停后上报被拒绝，保证两侧状态一致）；
 - release_rolling_back：发布已回滚（回滚中的设备上报被拒绝）；
 - release_finished：发布已完成；
 - invalid_stage：未知阶段；
 - stale_stage：阶段顺序回退（例如已到 REBOOT 又报 VERIFY）。
+
+归属路由：上报可显式携带 release_id；设备跨轮复用后，旧一轮迟到的上报
+（携带旧 release_id）按旧发布的当前状态被区分拒绝，不会写入新一轮记录，
+也不会把已升到新版本的设备改回去。未携带 release_id 时按当前占用指针路由。
 
 阶段规则：DOWNLOAD < VERIFY < INSTALL < REBOOT < SUCCESS/FAIL；
 同阶段重复上报幂等；SUCCESS/FAIL 为终态，之后只允许重复同一终态。
@@ -42,6 +47,7 @@ class ReportService:
         device_id: str,
         stage: ReportStage,
         failure_reason: str | None = None,
+        release_id: str | None = None,
     ) -> DeviceView:
         with self.store.lock:
             # 1) 设备存在
@@ -56,12 +62,15 @@ class ReportService:
                 except ValueError:
                     raise OtaError(RejectReason.INVALID_STAGE, f"stage={stage!r}")
 
-            # 3) 设备必须属于某个进行中发布（即在目标分组且已被批次分配）。
-            #    回滚后 active 指针虽已清除，但最近记录指向已回滚发布时，
-            #    必须优先给出“回滚中”这一可区分原因。
-            release_id = self.store.get_active(device_id)
-            release = None
-            record = None
+            # 3) 归属判定：
+            #    - 显式携带 release_id 时按该发布路由（设备跨轮复用后，旧一轮迟到
+            #      的上报由此被区分拒绝，不会污染新一轮记录）；
+            #    - 未携带时按当前进行中发布的占用指针路由；
+            #    - 无占用指针时回看最近一次记录：已回滚发布 => 回滚中；
+            #      已完成发布 => 终态重传幂等 / 其余按已完成拒绝；
+            #      都没有 => 设备不在任何目标分组。
+            if release_id is None:
+                release_id = self.store.get_active(device_id)
             if release_id is None:
                 latest = self.store.latest_record_for_device(device_id)
                 if latest is not None:
@@ -70,6 +79,10 @@ class ReportService:
                         raise OtaError(
                             RejectReason.RELEASE_ROLLING_BACK,
                             f"release_id={latest.release_id} rolled back",
+                        )
+                    if latest_release is not None and latest_release.state == ReleaseState.COMPLETED:
+                        return self._completed_release_report(
+                            device_id, latest, latest_release, stage
                         )
                 raise OtaError(
                     RejectReason.DEVICE_NOT_IN_TARGET_GROUP,
@@ -80,6 +93,13 @@ class ReportService:
                 raise OtaError(RejectReason.RELEASE_NOT_FOUND, f"release_id={release_id}")
             record = self.store.get_record(release_id, device_id)
             if record is None:
+                active = self.store.get_active(device_id)
+                if active is not None and active != release_id:
+                    # 设备当下被另一个进行中发布占用，上报却指向本发布：可区分拒绝
+                    raise OtaError(
+                        RejectReason.DEVICE_IN_ANOTHER_ACTIVE_RELEASE,
+                        f"device_id={device_id} occupied by release_id={active}",
+                    )
                 raise OtaError(
                     RejectReason.DEVICE_NOT_IN_TARGET_GROUP,
                     f"device_id={device_id} has no rollout record in {release_id}",
@@ -186,6 +206,35 @@ class ReportService:
             return self._device_view(device)
 
     # ---------------- 内部 ----------------
+
+    def _completed_release_report(self, device_id, record, release, stage) -> DeviceView:
+        """发布已完成后迟到的上报：终态重传幂等，其余按已完成拒绝。
+
+        绝不修改任何记录，保证旧一轮迟到上报不会把已升级设备改回去。
+        """
+        same_terminal = (
+            (record.status == UpgradeStatus.SUCCEEDED and stage == ReportStage.SUCCESS)
+            or (record.status == UpgradeStatus.FAILED and stage == ReportStage.FAIL)
+        )
+        if same_terminal:
+            log_decision(
+                "report",
+                {"device_id": device_id, "release_id": release.release_id,
+                 "stage": stage.value},
+                f"idempotent_already_{record.status.value}_after_completion",
+            )
+            return self._device_view(device_id)
+        log_decision(
+            "report",
+            {"device_id": device_id, "release_id": release.release_id,
+             "stage": stage.value},
+            "rejected_release_finished",
+            record_status=record.status.value,
+        )
+        raise OtaError(
+            RejectReason.RELEASE_FINISHED,
+            f"release_id={release.release_id} completed",
+        )
 
     def _failure_ratio(self, release_id: str) -> float | None:
         failed = succeeded = 0

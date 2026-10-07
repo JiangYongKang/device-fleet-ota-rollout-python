@@ -144,9 +144,10 @@ class ReleaseService:
                 if occupied_by == release_id:
                     continue  # 幂等：已属于本发布
                 if occupied_by is not None:
-                    # 已被其它进行中发布占用：不重复分配，记录可解释
+                    # 已被其它进行中发布占用：不重复分配，记录占用者以便查询时解释
                     if device_id not in release.skipped_device_ids:
                         release.skipped_device_ids.append(device_id)
+                    release.skipped_devices[device_id] = occupied_by
                     log_decision(
                         "advance_assign",
                         {"release_id": release_id, "device_id": device_id, "batch": idx},
@@ -310,7 +311,23 @@ class ReleaseService:
         ):
             release.state = ReleaseState.COMPLETED
             release.updated_at = self.store.clock.now()
-            log_decision("completion", {"release_id": release.release_id}, "all_terminal_completed")
+            # 发布收尾：释放全部设备占用，使同一批设备可进入下一轮发布
+            released = self._release_devices(release)
+            log_decision(
+                "completion",
+                {"release_id": release.release_id},
+                "all_terminal_completed",
+                released_devices=released,
+            )
+
+    def _release_devices(self, release: Release) -> list[str]:
+        """解除本发布对所有设备的占用（仅当占用指针仍指向本发布）。"""
+        released: list[str] = []
+        for rec in self.store.list_records(release.release_id):
+            if self.store.get_active(rec.device_id) == release.release_id:
+                self.store.clear_active(rec.device_id)
+                released.append(rec.device_id)
+        return sorted(released)
 
     def _counts(self, release: Release) -> dict[str, int]:
         succeeded = failed = rolled_back = inflight = 0
@@ -364,4 +381,8 @@ class ReleaseService:
                 for b in release.batches
             ],
             skipped_device_ids=list(release.skipped_device_ids),
+            skipped=[
+                {"device_id": d, "occupied_by": release.skipped_devices[d]}
+                for d in sorted(release.skipped_devices)
+            ],
         )
