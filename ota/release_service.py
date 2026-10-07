@@ -20,6 +20,8 @@ from .decision import log_decision
 from .errors import OtaError, RejectReason
 from .models import (
     PAUSE_STATES,
+    TERMINAL_RELEASE_STATES,
+    TERMINAL_UPGRADE_STATUSES,
     Batch,
     BatchState,
     PauseReason,
@@ -27,7 +29,6 @@ from .models import (
     ReleaseState,
     ReleaseView,
     RolloutRecord,
-    TERMINAL_UPGRADE_STATUSES,
     UpgradeStatus,
 )
 from .store import Store
@@ -139,12 +140,22 @@ class ReleaseService:
 
             batch = release.batches[idx]
             assigned_now: list[str] = []
+            firmware = self.store.get_firmware(release.firmware_id)
+            target_version = firmware.version if firmware is not None else None
             for device_id in batch.device_ids:
                 occupied_by = self.store.get_active(device_id)
                 if occupied_by == release_id:
                     continue  # 幂等：已属于本发布
                 if occupied_by is not None:
-                    # 已被其它进行中发布占用：不重复分配，记录可解释
+                    occupier = self.store.get_release(occupied_by)
+                    if occupier is None or occupier.state in TERMINAL_RELEASE_STATES:
+                        # 占用指针指向已收尾（完成/回滚）的发布：属于遗留脏指针。
+                        # 收尾时本应释放，这里防御性清除，保证设备对新一轮真正可分配。
+                        self.store.clear_active(device_id)
+                        occupied_by = None
+                if occupied_by is not None:
+                    # 已被另一条进行中发布占用：不重复分配，记录“被谁占用”以便解释。
+                    # 不把该设备从批次中抹掉：占用方收尾后，后续新一轮发布会重新分它。
                     if device_id not in release.skipped_device_ids:
                         release.skipped_device_ids.append(device_id)
                     log_decision(
@@ -160,7 +171,10 @@ class ReleaseService:
                     release_id=release_id,
                     batch_index=idx,
                     status=UpgradeStatus.PENDING,
+                    # 版本基线在“真正分配”的一刻按设备当时实际生效版本快照，
+                    # 每轮独立：上一轮的结果不会串到新一轮。
                     from_version=device.firmware_version,
+                    target_version=target_version,
                     assigned_at=self.store.clock.now(),
                     updated_at=self.store.clock.now(),
                 )
@@ -243,16 +257,17 @@ class ReleaseService:
                     device.firmware_version = rec.from_version
                 rec.status = UpgradeStatus.ROLLED_BACK
                 rec.updated_at = self.store.clock.now()
-                self.store.clear_active(rec.device_id)
             for batch in release.batches:
                 if batch.state == BatchState.OPEN:
                     batch.state = BatchState.DONE
             release.state = ReleaseState.ROLLED_BACK
             release.updated_at = self.store.clock.now()
+            # 回滚同样收尾：设备解除占用，可被后续新一轮发布重新分配
+            self._release_devices(release)
             log_decision(
                 "rollback",
                 {"release_id": release_id},
-                "rolled_back_devices_restored",
+                "rolled_back_devices_restored_and_released",
                 affected=self._counts(release),
             )
             return self._view(release)
@@ -282,15 +297,10 @@ class ReleaseService:
         return release
 
     def _refresh_progress(self, release: Release) -> None:
-        """把已全部终态的开放批次收口为 DONE，并判断是否完成发布。"""
-        records = self.store.list_records(release.release_id)
-        by_batch: dict[int, list[RolloutRecord]] = {}
-        for rec in records:
-            by_batch.setdefault(rec.batch_index, []).append(rec)
+        """把已全部终态的开放批次收口为 DONE，并判断是否完成。"""
         for batch in release.batches:
             if batch.state != BatchState.OPEN:
                 continue
-            recs = by_batch.get(batch.index, [])
             assigned = [d for d in batch.device_ids
                         if self.store.get_record(release.release_id, d) is not None]
             if not assigned:
@@ -310,7 +320,24 @@ class ReleaseService:
         ):
             release.state = ReleaseState.COMPLETED
             release.updated_at = self.store.clock.now()
-            log_decision("completion", {"release_id": release.release_id}, "all_terminal_completed")
+            # 发布正常收尾：设备重新变为可分配状态，后续针对同一批设备的新一轮
+            # 发布才能真正把它们分进去（而不是看到一个已结束发布还“占着”设备）。
+            self._release_devices(release)
+            log_decision(
+                "completion",
+                {"release_id": release.release_id},
+                "all_terminal_completed_devices_released",
+            )
+
+    def _release_devices(self, release: Release) -> None:
+        """解除本发布对设备的“进行中发布”占用。
+
+        仅清除确实指向本发布的 active 指针，绝不误清设备之后参与的另一条发布。
+        完成与回滚两条收尾路径共用，保证：任一收尾方式之后，设备都可给下一轮使用。
+        """
+        for rec in self.store.list_records(release.release_id):
+            if self.store.get_active(rec.device_id) == release.release_id:
+                self.store.clear_active(rec.device_id)
 
     def _counts(self, release: Release) -> dict[str, int]:
         succeeded = failed = rolled_back = inflight = 0
@@ -364,4 +391,38 @@ class ReleaseService:
                 for b in release.batches
             ],
             skipped_device_ids=list(release.skipped_device_ids),
+            skipped_devices=self._skipped_view(release),
         )
+
+    def _skipped_view(self, release: Release) -> list[dict]:
+        """跳过明细：每台设备当下被哪条进行中发布占着（纯只读、可复现）。
+
+        - occupied_by 为当前真实占用该设备的进行中发布；若占用方已收尾释放，
+          设备对本/后续发布重新可分配，still_blocked=False 且 occupied_by=None；
+        - skipped_at_release_id 保留最初跳过时的占用方，便于解释历史来源。
+        """
+        out: list[dict] = []
+        for device_id in release.skipped_device_ids:
+            occupier_id = self.store.get_active(device_id)
+            occupier = (
+                self.store.get_release(occupier_id)
+                if occupier_id is not None else None
+            )
+            still_blocked = (
+                occupier is not None
+                and occupier.state not in TERMINAL_RELEASE_STATES
+            )
+            occupier_fw = (
+                self.store.get_firmware(occupier.firmware_id)
+                if occupier is not None else None
+            )
+            out.append({
+                "device_id": device_id,
+                "occupied_by_release_id": occupier_id if still_blocked else None,
+                "occupier_state": occupier.state.value if still_blocked else None,
+                "occupier_target_version": (
+                    occupier_fw.version if still_blocked and occupier_fw else None
+                ),
+                "still_blocked": still_blocked,
+            })
+        return out

@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
-
 # ---- 设备相关 ----
 
 class DeviceStatus(str, Enum):
@@ -82,6 +81,12 @@ ACTIVE_RELEASE_STATES = frozenset({
     ReleaseState.AUTO_PAUSED,
 })
 
+# 已收尾的发布状态：走到这里的发布不再占用设备，其设备对后续新一轮发布重新可分配。
+TERMINAL_RELEASE_STATES = frozenset({
+    ReleaseState.ROLLED_BACK,
+    ReleaseState.COMPLETED,
+})
+
 PAUSE_STATES = frozenset({ReleaseState.PAUSED, ReleaseState.AUTO_PAUSED})
 
 
@@ -131,7 +136,12 @@ class DeviceView:
 
 @dataclass
 class RolloutRecord:
-    """单台设备在一次发布中的升级记录。"""
+    """单台设备在一次发布中的升级记录。
+
+    from_version 在设备被分配进发布的那一刻快照：记录该轮升级的版本基线，
+    后续轮次会基于设备当时实际生效版本重新快照，各轮互不串扰。
+    target_version 同样在分配时快照，避免固件元数据后续变更/删除影响历史结论。
+    """
     device_id: str
     release_id: str
     batch_index: int
@@ -139,6 +149,7 @@ class RolloutRecord:
     last_stage: Optional[ReportStage] = None
     failure_reason: Optional[str] = None
     from_version: Optional[str] = None
+    target_version: Optional[str] = None
     reported_count: int = 0
     assigned_at: Optional[float] = None
     updated_at: Optional[float] = None
@@ -187,3 +198,27 @@ class ReleaseView:
     next_batch_to_open: int
     batches: list[dict]
     skipped_device_ids: list[str]
+    # 跳过明细：每台设备被哪条“进行中”的发布占用、占用方当时的状态与目标版本。
+    # 占用方收尾（完成/回滚）后，后续推进重试时对应明细会被移除，设备真正分进来。
+    skipped_devices: list[dict] = field(default_factory=list)
+
+
+@dataclass
+class DeviceReleaseHistoryItem:
+    """设备参与过的一次发布的结论（升级历史中的一项）。
+
+    重复查询得到的结论一致：所有字段都来自分配时快照与最终记录，
+    不随设备后续轮次或固件元数据变化而改变。
+    """
+    release_id: str
+    firmware_id: str
+    from_version: Optional[str]      # 该轮分配时设备实际生效版本（基线）
+    target_version: Optional[str]    # 该轮目标固件版本
+    batch_index: int
+    status: UpgradeStatus
+    last_stage: Optional[ReportStage]
+    failure_reason: Optional[str]
+    release_state: Optional[ReleaseState]  # 该发布最终/当前状态
+    active: bool                     # 该发布是否仍是设备当前进行中的发布
+    assigned_at: Optional[float]
+    updated_at: Optional[float]

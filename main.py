@@ -12,8 +12,8 @@ from fastapi.responses import JSONResponse
 from ota import (
     DeviceService,
     FakeClock,
-    ReportService,
     ReleaseService,
+    ReportService,
     Store,
     SystemClock,
 )
@@ -63,6 +63,12 @@ def heartbeat(device_id: str, ts: float | None = None):
 @app.get("/devices/{device_id}")
 def get_device(device_id: str):
     return _device_dict(device_service.get_device(device_id))
+
+
+@app.get("/devices/{device_id}/history")
+def get_device_history(device_id: str):
+    # 设备参与过的历次发布：每轮的版本基线、目标版本与最终结果，按轮次升序
+    return [_history_dict(v) for v in device_service.release_history(device_id)]
 
 
 @app.get("/devices")
@@ -124,8 +130,17 @@ def list_releases():
 
 # ---- report ----
 @app.post("/devices/{device_id}/report")
-def report_upgrade_result(device_id: str, stage: ReportStage, failure_reason: str | None = None):
-    return _device_dict(report_service.report_result(device_id, stage, failure_reason))
+def report_upgrade_result(
+    device_id: str,
+    stage: ReportStage,
+    failure_reason: str | None = None,
+    release_id: str | None = None,
+):
+    # release_id 可选：用于连续多轮升级时明确“这是哪一轮”的上报，
+    # 防止旧一轮迟到上报被写到新一轮记录上。缺省按设备当前进行中的发布路由。
+    return _device_dict(
+        report_service.report_result(device_id, stage, failure_reason, release_id)
+    )
 
 
 # ---- serializers ----
@@ -165,4 +180,22 @@ def _release_dict(v):
         "next_batch_to_open": v.next_batch_to_open,
         "batches": v.batches,
         "skipped_device_ids": v.skipped_device_ids,
+        "skipped_devices": v.skipped_devices,
+    }
+
+
+def _history_dict(v):
+    return {
+        "release_id": v.release_id,
+        "firmware_id": v.firmware_id,
+        "from_version": v.from_version,
+        "target_version": v.target_version,
+        "batch_index": v.batch_index,
+        "status": v.status.value,
+        "last_stage": v.last_stage.value if v.last_stage else None,
+        "failure_reason": v.failure_reason,
+        "release_state": v.release_state.value if v.release_state else None,
+        "active": v.active,
+        "assigned_at": v.assigned_at,
+        "updated_at": v.updated_at,
     }

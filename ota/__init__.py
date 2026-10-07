@@ -3,6 +3,7 @@
 from .clock import Clock, FakeClock, SystemClock
 from .device_service import DeviceService
 from .errors import OtaError, RejectReason
+from .models import DeviceReleaseHistoryItem
 from .report_service import ReportService
 from .release_service import ReleaseService
 from .store import Store
@@ -24,5 +25,6 @@ __all__ = [
     "ReportService",
     "OtaError",
     "RejectReason",
+    "DeviceReleaseHistoryItem",
     "build_services",
 ]

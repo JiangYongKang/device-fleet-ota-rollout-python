@@ -67,6 +67,17 @@ class Store:
         out = [r for (rid, _d), r in self.records.items() if rid == release_id]
         return sorted(out, key=lambda r: (r.batch_index, r.device_id))
 
+    def list_records_for_device(self, device_id: str) -> list[RolloutRecord]:
+        """设备参与过的全部发布记录（升级历史），按分配时间升序、结果确定可复现。"""
+        out = [r for (_rid, d), r in self.records.items() if d == device_id]
+        return sorted(
+            out,
+            key=lambda r: (
+                r.assigned_at if r.assigned_at is not None else -1.0,
+                r.release_id,
+            ),
+        )
+
     def latest_record_for_device(self, device_id: str) -> Optional[RolloutRecord]:
         """该设备最近一次发布记录（用于回滚清除 active 后仍能回看最终状态）。"""
         recs = [r for (rid, d), r in self.records.items() if d == device_id]

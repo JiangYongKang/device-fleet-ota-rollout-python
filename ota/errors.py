@@ -25,3 +25,6 @@ class RejectReason(str, Enum):
     STALE_STAGE = "stale_stage"
     ILLEGAL_RELEASE_STATE = "illegal_release_state"
     BATCH_NOT_OPEN = "batch_not_open"
+    # 旧一轮发布的迟到上报：设备当前属于另一条发布线（或上报显式指定了
+    # 非当前进行中的发布），该上报不得作用于当前轮次，必须可区分地拒绝。
+    STALE_RELEASE_REPORT = "stale_release_report"

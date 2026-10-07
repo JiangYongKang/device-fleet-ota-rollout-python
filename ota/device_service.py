@@ -11,9 +11,10 @@
 from .decision import log_decision
 from .errors import OtaError, RejectReason
 from .models import (
-    Device,
-    DeviceView,
     TERMINAL_UPGRADE_STATUSES,
+    Device,
+    DeviceReleaseHistoryItem,
+    DeviceView,
     UpgradeStatus,
 )
 from .store import Store
@@ -88,6 +89,50 @@ class DeviceService:
     def list_devices(self) -> list[DeviceView]:
         with self.store.lock:
             return [self._view(d) for d in self.store.list_devices()]
+
+    def release_history(self, device_id: str) -> list[DeviceReleaseHistoryItem]:
+        """设备参与过的历次发布：每轮的目标版本、版本基线与最终结果。
+
+        语义与兼容范围：
+        - 按设备被分配进发布的时间（assigned_at，平手再按 release_id）升序返回，
+          同一份状态重复查询结论严格一致；查询是只读的，不改变任何状态；
+        - 每轮的 from_version/target_version 都取自该轮“分配时快照”，
+          不随后续轮次或固件元数据变更而改变，各轮结论互不串扰；
+        - active=True 仅出现在设备当前进行中的那一轮；已完成/已回滚的轮次
+          active=False，但仍完整保留其最终状态与 release_state，可长期回看；
+        - 历史只包含设备真正被分配进去的发布；仅被“跳过（busy）”的发布
+          不会出现在设备历史中（该信息可在发布视图的 skipped_devices 查到）。
+        """
+        with self.store.lock:
+            device = self.store.get_device(device_id)
+            if device is None:
+                raise OtaError(RejectReason.DEVICE_NOT_FOUND, f"device_id={device_id}")
+            active_id = self.store.get_active(device_id)
+            items: list[DeviceReleaseHistoryItem] = []
+            for rec in self.store.list_records_for_device(device_id):
+                release = self.store.get_release(rec.release_id)
+                items.append(DeviceReleaseHistoryItem(
+                    release_id=rec.release_id,
+                    firmware_id=release.firmware_id if release is not None else "",
+                    from_version=rec.from_version,
+                    target_version=rec.target_version,
+                    batch_index=rec.batch_index,
+                    status=rec.status,
+                    last_stage=rec.last_stage,
+                    failure_reason=rec.failure_reason,
+                    release_state=release.state if release is not None else None,
+                    active=(active_id == rec.release_id),
+                    assigned_at=rec.assigned_at,
+                    updated_at=rec.updated_at,
+                ))
+            log_decision(
+                "release_history",
+                {"device_id": device_id},
+                "returned",
+                rounds=len(items),
+                active_release_id=active_id,
+            )
+            return items
 
     # ---------- internals ----------
 
